@@ -49,6 +49,9 @@ model = LlamaForCausalLM.from_pretrained(
 # FP16 연산 시 수치 불안정성 문제를 완화하기 위해, 생성 시 logits를 FP32로 캐스팅합니다.
 class FP32CastLogitsProcessor(LogitsProcessor):
     def __call__(self, input_ids, scores):
+        scores = scores.float()
+        scores = torch.where(torch.isnan(scores), torch.full_like(scores, -1e9), scores)
+        scores = torch.where(torch.isinf(scores), torch.full_like(scores, -1e9), scores)
         return scores.float()
 
 logits_processor = LogitsProcessorList([FP32CastLogitsProcessor()])
@@ -132,9 +135,11 @@ for num_batches in num_batches_list:
                 start_event.record()
                 outputs = model.generate(
                     input_ids,
+                    attention_mask=attention_mask,
                     max_new_tokens=32,
                     temperature=0.7,
                     top_p=0.9,
+                    do_sample=True,
                     use_cache=False,
                     logits_processor=logits_processor
                 )
@@ -145,9 +150,11 @@ for num_batches in num_batches_list:
                 start_time = time.time()
                 outputs = model.generate(
                     input_ids,
+                    attention_mask=attention_mask,
                     max_new_tokens=32,
                     temperature=0.7,
                     top_p=0.9,
+                    do_sample=True,
                     use_cache=False,
                     logits_processor=logits_processor
                 )

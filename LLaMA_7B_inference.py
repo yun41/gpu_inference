@@ -50,12 +50,15 @@ model = LlamaForCausalLM.from_pretrained(
 # FP16 연산 시 발생할 수 있는 수치 불안정성을 줄이기 위해, 생성 시 logits를 FP32로 캐스팅합니다.
 class FP32CastLogitsProcessor(LogitsProcessor):
     def __call__(self, input_ids, scores):
+        scores = scores.float()
+        scores = torch.where(torch.isnan(scores), torch.full_like(scores, -1e9), scores)
+        scores = torch.where(torch.isinf(scores), torch.full_like(scores, -1e9), scores)
         return scores.float()
 
 logits_processor = LogitsProcessorList([FP32CastLogitsProcessor()])
 
 # --- Dataset Setup ---
-dataset = load_dataset("Skylion007/openwebtext", split="train")
+dataset = load_dataset("Skylion007/openwebtext", split="train", trust_remote_code=True)
 texts = [entry["text"] for entry in dataset.select(range(256))]
 
 # Ensure exactly 256 sentences (pad if needed)
@@ -73,6 +76,8 @@ class TextDataset(Dataset):
         return len(self.texts)
 
     def __getitem__(self, idx):
+        text = self.texts[idx]
+        prompt = f"User: {text}\nAssistant:"
         encoding = self.tokenizer(
             self.texts[idx],
             return_tensors="pt",
@@ -83,7 +88,7 @@ class TextDataset(Dataset):
         return encoding["input_ids"].squeeze(0), encoding["attention_mask"].squeeze(0)
 
 # --- Inference and Latency Measurement ---
-num_batches_list = [4, 8, 16, 32, 64]
+num_batches_list = [4, 8, 16, 32]
 
 for num_batches in num_batches_list:
     batch_size = min(64, 256 // num_batches)
@@ -106,7 +111,10 @@ for num_batches in num_batches_list:
                 # logits_processor를 추가하여 생성 시 FP32로 캐스팅하도록 함
                 outputs = model.generate(
                     input_ids,
+                    attention_mask=attention_mask,
                     max_new_tokens=32,
+                    do_sample=True,
+                    temperature=0.7,
                     logits_processor=logits_processor
                 )
                 end_event.record()
@@ -116,7 +124,10 @@ for num_batches in num_batches_list:
                 start_time = time.time()
                 outputs = model.generate(
                     input_ids,
+                    attention_mask=attention_mask,
                     max_new_tokens=32,
+                    do_sample=True,
+                    temperature=0.7,
                     logits_processor=logits_processor
                 )
                 latency = (time.time() - start_time) * 1000  # ms

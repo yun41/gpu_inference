@@ -1,120 +1,106 @@
+import os
+os.environ["USE_DHA_MEMORY"] = "1"
+
 import torch
 import torchvision.transforms as transforms
 from torchvision.models import resnet50, ResNet50_Weights
 from PIL import Image
-import time
 import glob
-import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader, Dataset
+import numpy as np
+import pycuda.driver as cuda
+import pycuda.autoinit
+from collections import defaultdict
 
-# Load the pre-trained ResNet-50 model
+# -------- 모델 설정 --------
 model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
-model.eval()  # Set model to evaluation mode
+model.eval()
 print(f"Running on: {device}")
 
-# Image transformation
+# -------- 전처리 --------
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
 ])
 
-# Custom dataset class
-class ImageDataset(Dataset):
-    def __init__(self, image_paths, transform=None):
-        self.image_paths = image_paths
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.image_paths)
-
-    def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        img = Image.open(img_path).convert("RGB")
-        if self.transform:
-            img = self.transform(img)
-        return img, img_path  # Return image and path
-
-# Load images from folder
-image_paths = glob.glob("images/selected/*.jpg")  # Replace with actual folder
+# -------- 이미지 로드 --------
+image_paths = glob.glob("images/selected/*.jpg")
 total_images = len(image_paths)
+assert total_images > 0, "No images found."
 
-if total_images == 0:
-    print("No images found in the directory. Please check your path.")
-    exit()
+# -------- DHA 메모리 할당 --------
+def allocate_host_mapped_tensor(shape, dtype=torch.float32):
+    nbytes = int(torch.empty(shape, dtype=dtype).nbytes)
+    host_buf = cuda.pagelocked_empty(nbytes, np.uint8, mem_flags=cuda.host_alloc_flags.DEVICEMAP)
+    tensor = torch.frombuffer(host_buf, dtype=dtype).reshape(shape)
+    return tensor
 
-# Load ImageNet class labels
-with open("imagenet_classes.txt") as f:
-    labels = [line.strip() for line in f.readlines()]
+# -------- 워밍업 --------
+warmup_input = torch.randn(1, 3, 224, 224, device=device)
+for _ in range(5):
+    _ = model(warmup_input)
+torch.cuda.synchronize()
 
-# Create DataLoader
-dataset = ImageDataset(image_paths, transform=transform)
-dataloader = DataLoader(dataset, batch_size=1, shuffle=False)  # Process images one by one
+# -------- Batch Size별 Layer-by-Layer Latency 측정 --------
+batch_sizes = [1, 2, 4, 8, 16, 32]
 
-# Perform layer-wise execution and measure latency
-with torch.no_grad():
-    total_latency = 0
-    for batch, paths in dataloader:
-        batch = batch.to(device)
+for batch_size in batch_sizes:
+    print(f"\n========== Running DHA Layer-by-Layer measurement (Batch size: {batch_size}) ==========")
 
-        # Measure latency for each layer
-        layer_latencies = []
-        x = batch  # Input to model
+    # Layer별 latency 기록용
+    layer_latencies = defaultdict(float)
+    layer_counts = defaultdict(int)
+    total_latency = 0.0
 
-        for name, layer in model.named_children():  # Process each layer separately
-            if device.type == "cuda":
+    with torch.no_grad():
+        # 이미지 배치 생성
+        for batch_start in range(0, total_images, batch_size):
+            batch_end = min(batch_start + batch_size, total_images)
+            current_batch_size = batch_end - batch_start
+            if current_batch_size <= 0:
+                continue
+
+            # DHA 메모리 할당
+            host_tensor = allocate_host_mapped_tensor((current_batch_size, 3, 224, 224))
+
+            # 이미지 로드
+            for i, img_idx in enumerate(range(batch_start, batch_end)):
+                img = Image.open(image_paths[img_idx]).convert("RGB")
+                img_tensor = transform(img)
+                host_tensor[i] = img_tensor
+
+            # DHA → GPU
+            input_tensor = host_tensor.cuda(non_blocking=True)
+
+            # layer-by-layer 측정
+            x = input_tensor
+            for name, layer in model.named_children():
                 torch.cuda.synchronize()
-                start_event = torch.cuda.Event(enable_timing=True)
-                end_event = torch.cuda.Event(enable_timing=True)
+                start_evt = torch.cuda.Event(enable_timing=True)
+                end_evt = torch.cuda.Event(enable_timing=True)
 
-                start_event.record()
-                if name == "fc":  
-                    x = torch.flatten(x, start_dim=1)  # Flatten before passing to fully connected layer
-                x = layer(x)  # Pass input through current layer
-
-                end_event.record()
-
+                start_evt.record()
+                if name == "fc":
+                    x = torch.flatten(x, 1)
+                x = layer(x)
+                end_evt.record()
                 torch.cuda.synchronize()
-                latency = start_event.elapsed_time(end_event)  # Time in ms
-            else:
-                start_time = time.time()
-                x = layer(x)  # Pass input through current layer
-                end_time = time.time()
-                latency = (end_time - start_time) * 1000  # Convert to ms
 
-            layer_latencies.append((name, latency))
+                latency = start_evt.elapsed_time(end_evt)  # ms
+                layer_latencies[name] += latency
+                layer_counts[name] += 1
 
-        # Print latency per layer
-        # print("\nLayer-wise Execution Latency:")
-        # for name, latency in layer_latencies:
-        #     print(f"Layer: {name} → Latency: {latency:.3f} ms")
+    # 결과 출력
+    print("\n[DHA 기반 Layer-by-Layer 평균 Latency]")
+    batch_total_latency = 0.0
+    for name in model._modules:
+        if layer_counts[name]:
+            avg_latency = layer_latencies[name] / layer_counts[name]
+            print(f"Layer: {name:<12} → Avg Latency: {avg_latency:.3f} ms")
+            batch_total_latency += avg_latency
 
-        total_latency += sum(lat for _, lat in layer_latencies)
-
-    print(f"\nTotal Inference Latency: {total_latency:.3f} ms")
-
-# Save results to a file
-with open("resnet50_layer_latency.txt", "w") as f:
-    for name, latency in layer_latencies:
-        f.write(f"Layer: {name} → Latency: {latency:.3f} ms\n")
-
-print("Layer-wise execution latency saved in 'resnet50_layer_latency.txt'.")
-
-# Plot layer latency
-def plot_layer_latency(layer_latencies):
-    layer_names = [name for name, _ in layer_latencies]
-    layer_times = [lat for _, lat in layer_latencies]
-
-    plt.figure(figsize=(12, 6))
-    plt.bar(layer_names, layer_times)
-    plt.xticks(rotation=90)
-    plt.ylabel("Latency (ms)")
-    plt.xlabel("Layers")
-    plt.title("ResNet-50 Layer-wise Execution Latency")
-    plt.tight_layout()
-    plt.savefig("resnet50_layer_latency.png")  # Save the plot instead of displaying it
-    print("Layer-wise execution latency plot saved as 'resnet50_layer_latency.png'")
-
-plot_layer_latency(layer_latencies)
+    print(f"\nTotal Summed Layer-wise Inference Time (Batch size {batch_size}): {batch_total_latency:.3f} ms")
+    print("===================================================================")
